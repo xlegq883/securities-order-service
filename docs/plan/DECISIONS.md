@@ -142,4 +142,8 @@
 - 包结构目录形态（批次 0 执行单定稿：上下文在前、层在后）。
 - compose 细节、CI 写法、failsafe 命名约定（批次 0 执行单定稿）。
 - Mapper 约定（批次 0 定稿）：接口放 `<context>.infrastructure.mapper`，XML 放 `src/main/resources/mapper/<context>/`，`mapper-locations=classpath*:mapper/**/*.xml`；事件 topic 名走代码常量 `EventTopics`，不做配置化。
+- 投递组件归属（批次 1 定稿）：事件 outbox、上游指令与两个 relay、`EventPublisher`/`UpstreamCommandSender` 端口及其实现落在 `order` 上下文（见变更 7 覆盖 1，避免 execution↔order 成环）。
+- 测试档案约定（批次 1 定稿）：T1 = `local`（叠加 `test`）、T2 = `test`、T3 = `test-kafka`；`@ActiveProfiles` 为**合并**语义，profile 由各测试类自带、基类不上提；真库用例共用**进程内单例 MySQL 容器**（`--default-time-zone=+08:00`）。
+- 分层映射（批次 1 定稿）：api 层持有请求/响应 DTO，应用层以 `*Command`/`*View`/`*Result`/`*Outcome` 模型通信；应用服务直接使用 `*DO` 与本上下文 Mapper，api 负责 DTO ↔ 模型映射。
+- 语言特性约束（批次 1 定稿）：Java 17，**不使用 `switch` 模式匹配**（预览特性）；分支用 `instanceof` 模式匹配。
 - 游标编码格式、列表过滤参数集合、返回 DTO 形态（批次 2 执行单定稿）。

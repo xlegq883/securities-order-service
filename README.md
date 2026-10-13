@@ -36,7 +36,7 @@ com.fuzuyang.securities
 ├─ execution   成交累加与状态推导、缺口检测与修复
 ├─ query       订单/成交查询、读模型消费与重建
 ├─ eod         日终批处理编排、逐单过期、结算、一致性校验
-└─ common      api / error / exception / config / util
+└─ common      api / error / exception / config / metrics / util
 ```
 
 每个上下文按 `api → application → domain` 分层，`infrastructure` 依赖 `domain`/`application`；依赖单向，防腐层只在最外层。每个包以 `package-info.java` 声明依赖方向。
@@ -94,7 +94,7 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 
 **H2 与 mock mapper 禁止**用于并发 / Kafka 语义断言。
 
-> 注：`pom.xml` 将 Testcontainers 版本覆盖为 **1.21.4**（Boot 3.2.5 默认 1.19.7 与 Docker Engine 29 不兼容），详见 `DECISIONS.md` 变更 2。
+> 注：`pom.xml` 将 Testcontainers 版本覆盖为 **1.21.4**（Boot 3.2.5 默认 1.19.7 与 Docker Engine 29 不兼容），详见 `DECISIONS.md` **变更 3 · 覆盖 1**。
 
 ## 契约指针
 
@@ -108,11 +108,11 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 - **下单幂等**：`uk(account_id, client_order_id)`；参数一致 → 200 返回原订单；不一致 → 409 `IDEMPOTENT_REPLAY_CONFLICT`。幂等命中响应（下单与撤单）带 `upstreamCommandStatus`。
   - `order_no` 由服务端生成（`O + yyyyMMddHHmmssSSS + 6 位随机`）；**唯一性由 `uk_order_no` 保证**，生成器只降低碰撞率。`INSERT` 冲突后**回查区分两个唯一键**：命中账户幂等键 → 幂等分支；否则视为订单号碰撞 → 重新生成（最多 3 次，耗尽 → 503 `RETRY_EXHAUSTED`），并计 `order_order_no_collision_total`。
   - `LIMIT` 必带正数 `orderPrice`，`amount = orderPrice × quantity`；`MARKET` 的 `order_price` 与 `amount` 均为 NULL（成交金额与委托金额解耦）。
-- **成交序号契约**：`exec_seq` 为订单内**从 1 起、期望连续递增**的成交序号；缺口检测与补拉只依赖它，`exec_seq` **不作准入门槛**（累加可交换）。
-- **投递 relay**：事件与上游指令均"短事务认领（`IN_PROGRESS` + owner + 租约）→ **事务外**发送 → owner 守卫落结果（`SENT`/退避回 `PENDING`/达上限 `FAILED`）"。语义 = **at-least-once**；`SENT` 仅表示"已交给出站通道"，不代表上游受理。出站经端口（`EventPublisher`/`UpstreamCommandSender`），relay 不直接依赖 Kafka 客户端。硬约束 `claim-lease-seconds > batch-size × send-timeout-ms`（启动期校验）。
-- **缺口检测与修复**："已收到序号" = 已应用 ∪ 被拒；内部缺口（`minMissing > minSeen` 且 `max - minMissing >= grace-count`）或时间条件（无新回报 ≥ `grace-seconds`）触发；多洞只报最小。补拉**复用实时回报同一入口**（`source=PULL`）；端口关闭时缺口保持 `OPEN`（由 Gauge 暴露），达 `repair-max-attempts` → `FAILED`。
+- **成交序号契约**：`exec_seq` 为订单内**从 1 起、期望连续递增**的成交序号；只用于缺口观测与补拉，**不作准入门槛**（累加可交换）。`ExecutionReportSource.pull(orderNo, fromSeq, limit)` 返回 `seq >= fromSeq`（含边界）的成交回报。
+- **投递 relay（三阶段 + 至少一次）**：`短事务认领（IN_PROGRESS + owner + 租约）→ 事务外发送 → owner 守卫落结果（SENT / 退避回 PENDING / 达上限 FAILED）`。语义 = **at-least-once**：租约过期重认领、或"已发出但未标 `SENT` 时进程崩溃"都会**重复发送**，这是设计接受的行为；`SENT` 只表示"已交给出站通道"，不代表上游受理。重复敞口由 `relay_lease_reclaim_total{channel}` 度量（正常应为 0）。出站经端口（`EventPublisher`/`UpstreamCommandSender`），relay **不直接依赖 Kafka 客户端**；硬约束 `claim-lease-seconds > batch-size × send-timeout-ms`（启动期校验）。事件重复由读侧幂等消化，指令重复由上游按报文内幂等标识消化（SUBMIT 带 `clientOrderId`，CANCEL 带 `orderNo` + `exchangeOrderId`）。
+- **缺口检测与修复**："已收到序号" = **已应用 ∪ 被拒**（只用 `t_execution` 会把被拒成交当缺失，产生永远修不掉的幻影缺口）；内部缺口（`minMissing > minSeen` 且 `max - minMissing >= grace-count`）或时间条件（无新回报 ≥ `grace-seconds`）触发；多洞只报最小。补拉**复用实时回报同一入口**（`source=PULL`），退避 1s/5s/30s；端口关闭时缺口保持 `OPEN`（由 Gauge 暴露），达 `repair-max-attempts` → `FAILED` + `exec_gap_repair_exhausted_total`。
 - **响应边界**：报文/字段校验失败 → 400 `INVALID_PARAM` 且**零留痕**（不插报告表/不落差异/不计 applied-rejected）；业务/数据拒绝 → 200 + `applied:false` + `diffType`；撤单请求"订单不存在"→ 404，而回报管道里"订单不存在"→ 差异 `ORDER_NOT_FOUND`；真并发重试耗尽 → 503 `RETRY_EXHAUSTED`；发件箱唯一键冲突（程序缺陷）→ 500 且不进差异体系。
-- **本批指标**：Counter 计入 `AppMetrics`（点号名不带 `_total`，导出名由断言钉住）：`order_created_total`、`order_idempotent_replay_total`、`order_order_no_collision_total`、`report_applied_total`、`report_rejected_total{diff_type}`、`report_invalid_total{reason}`、`exec_dup_total`、`exec_overfill_total`、`exec_after_terminal_total`、`illegal_transition_total`、`state_transition_total`、`state_unchanged_total`、`cancel_request_total`、`cancel_not_cancelable_total`、`exec_gap_total`、`exec_gap_repair_exhausted_total`、`retry_attempt_total`、`retry_exhausted_total`、`relay_lease_reclaim_total{channel}`、`upstream_command_sent_total`、`upstream_command_failed_total`、`event_outbox_sent_total`。Gauge（周期采样、抓取不查库）：`upstream_command_pending`、`event_outbox_pending`、`exec_gap_open`。
+- **本批指标**：Counter 计入 `AppMetrics`（点号名不带 `_total`，导出名由断言钉住）：`order_created_total`、`order_idempotent_replay_total`、`order_order_no_collision_total`、`report_applied_total`、`report_rejected_total{diff_type}`、`report_invalid_total{reason}`、`exec_dup_total`、`exec_overfill_total`、`exec_after_terminal_total`、`illegal_transition_total`、`state_transition_total`、`state_unchanged_total`、`cancel_request_total`、`cancel_not_cancelable_total`、`exec_gap_total`、`exec_gap_repair_exhausted_total`、`retry_attempt_total`、`retry_exhausted_total`、`relay_lease_reclaim_total{channel}`、`upstream_command_sent_total`、`upstream_command_failed_total`、`event_outbox_sent_total`。Gauge 为**周期采样到内存**（默认 5s：`upstream_command_pending`、`event_outbox_pending`、`exec_gap_open`）——**Prometheus 抓取不产生任何数据库查询**，采样 SQL 均有索引支撑。
 - **撤单**：仅 `ACKNOWLEDGED`/`PARTIALLY_FILLED` 可撤；`SUBMITTED` 与终态返回 `ORDER_NOT_CANCELABLE` 且不写 `cancel_requested_at`；重复撤单幂等成功；不引入“撤单中”状态。
 - **读模型**：表与流一对一。`t_order_query` 由 `order-events` + 水位线驱动；`t_execution_query` 由 `execution-events` + `execution_id` 驱动且无水位线。跨流无顺序保证，只影响两表相对可见性。
 - **锁策略**：跨事务长锁用 `t_distributed_lock`（owner + 租约 + CAS + owner 守卫释放），**禁用 `GET_LOCK`**；事务内短锁用 `SELECT ... FOR UPDATE SKIP LOCKED`。
@@ -123,10 +123,39 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 - **时区与切日**：全链路 Asia/Shanghai；`business_date` = 下单时刻上海日期；EOD 只处理指定日；晚到回报归属原 `business_date`。
 - **事务边界与副作用持久化**：业务拒绝不回滚；非业务异常才回滚。凡业务事务会回滚的路径，副作用记录必须 `REQUIRES_NEW`（EOD 步骤/批次失败标记、relay 指令失败标记、缺口修复耗尽标记）。
 - **失败兜底与人工入口**：EOD 步骤失败 → `POST /api/eod/batch/{batchNo}/resume`；缺口修复用尽 → `POST /api/reconcile/diffs/{id}/resolve`；上游指令用尽 → `POST /api/upstream/commands/{id}/retry`；Kafka 超限进 DLT。
-- **重试边界**：白名单仅 `DeadlockLoserDataAccessException`、`CannotAcquireLockException`；尝试 3 次、间隔 50ms/200ms；事务内不得 catch 后重试。
-- **投递语义（至少一次）**：事件与上游指令的投递均为 **at-least-once** —— 认领租约过期后被重新认领、或"已发出但未标记 `SENT` 时进程崩溃"，都会导致**重复发送**，这是设计接受的行为，不是缺陷。事件重复由读侧幂等消化（`(aggregate_id, event_version)` 严格递增、`execution_id` 主键）；指令重复由上游按报文内幂等标识消化（SUBMIT 带 `clientOrderId`，CANCEL 带 `orderNo` + `exchangeOrderId`）。系统不做"发送前二次确认"这类会引入新竞态的补偿；重复敞口由 `relay.lease_reclaim_total{channel}` 度量，正常应为 0。
-- **`exec_seq` 契约与补拉边界**：`exec_seq` 为**订单内从 1 开始、期望连续递增**的成交序号；`ExecutionReportSource.pull(orderNo, fromSeq, limit)` 返回 **`seq >= fromSeq`**（含边界）的成交回报。上游违约（起始缺失、跳号）会被记为缺口差异（`EXEC_GAP`）并按退避补拉；"已收到序号"取"已应用 ∪ 被拒"两处之并，避免被拒成交造成幻影缺口。
-- **指标采样口径**：`upstream.command.pending`、`event.outbox.pending`、`exec.gap.open` 是**周期性采样**（默认 5s）到内存的 Gauge —— **Prometheus 抓取不产生任何数据库查询**；采样 SQL 均有索引支撑。Counter 只在事件发生时自增，无查询成本。
+- **重试边界**：白名单 = `DeadlockLoserDataAccessException`、`CannotAcquireLockException`、`RetryableDispatchException`（0 行分类矩阵兜底）；尝试 3 次、间隔 50ms/200ms；事务内不得 catch 后重试。**非白名单异常耗尽时原样抛出**，不映射 503。
+
+## 接口与配置（批次 1 落地）
+
+### REST 端点
+
+| 方法 | 路径 | 请求要点 | 响应 |
+|---|---|---|---|
+| POST | `/api/orders` | `{accountId, clientOrderId, securityCode, side ∈ BUY/SELL, orderType ∈ LIMIT/MARKET, orderPrice?, quantity}`；`LIMIT` 必带正数价、`MARKET` 禁带价 | 200 `{orderNo, …, upstreamCommandStatus}`；`clientOrderId` 参数不一致 → 409 |
+| POST | `/api/reports` | `{reportType ∈ ORDER_ACKED / ORDER_REJECTED / CANCEL_ACKED / EXECUTION, orderNo, exchangeOrderId?, exchangeSeq?, executionId?, execSeq?, execQuantity?, execPrice?, execAmount?, execTime?, source?}` | 统一 200 `{orderNo, applied, diffType?, filledQuantity?, status?}`；报文/字段非法 → 400（零留痕） |
+| POST | `/api/orders/{orderNo}/cancel` | 无体 | 200 `{orderNo, status, cancelRequestedAt, upstreamCommandStatus}`（已请求过亦 200，**不重新入队**）；不可撤 400 / 不存在 404 |
+
+### 测试档案与中间件
+
+- profile：**T1 = `local`（叠加 `test`）**、**T2 = `test`**、**T3 = `test-kafka`**。`@ActiveProfiles` 是**合并**语义，故 profile 由各测试类自带，基类不上提。
+- `AbstractMySqlIT` 用**进程内单例 MySQL 容器**（`@ServiceConnection`，`--default-time-zone=+08:00`，启动一次、JVM 退出停止）；跨类共用同一库，relay/事件用例在 `@BeforeEach` 清空投递表自隔离，其余断言按订单维度。
+- relay / 缺口任务在测试中手动 `runOnce()`，不依赖 `@Scheduled` 节拍。
+
+### 批次 1 新增配置键
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `app.outbox.publisher` | `KAFKA` | `KAFKA` / `LOG`（测试与离线） |
+| `app.outbox.send-timeout-ms` | `3000` | 单条发送超时 |
+| `app.outbox.claim-lease-seconds` | `600` | 认领租约；**必须 > `batch-size × send-timeout-ms / 1000`**（启动期 `@AssertTrue` 校验） |
+| `app.upstream.command-relay-enabled` | `true` | 指令投递定时开关 |
+| `app.upstream.command-transport` | `LOG` | `LOG` / `HTTP` / `GRPC`（**同时**决定装配哪个 sender 与写入指令行的 `transport`） |
+| `app.upstream.scan-interval-ms` / `batch-size` / `send-timeout-ms` / `claim-lease-seconds` | `1000` / `100` / `3000` / `600` | 指令投递参数（同 outbox 的租约硬约束） |
+| `app.upstream.execution-source.enabled` | `false` | 缺口补拉端口（关闭时缺口保持 `OPEN`，由 Gauge 暴露） |
+| `app.gap.scan-enabled` / `scan-interval-ms` / `scan-window-seconds` / `scan-batch-size` / `grace-count` / `grace-seconds` / `repair-max-attempts` / `repair-batch-size` | `true` / `10000` / `300` / `500` / `3` / `30` / `3` / `100` | 缺口扫描与修复 |
+| `app.execution-conflict.precheck-enabled` | `true` | `uk_execution_id` 跨订单**事前检查**（关闭则强制走兜底路径，供测试） |
+| `app.metrics.sample-interval-ms` | `5000` | Gauge 周期采样间隔 |
+| `spring.task.scheduling.pool.size` | `4` | 调度隔离（relay 长批次不饿死采样/缺口扫描） |
 
 ## 批次进度
 

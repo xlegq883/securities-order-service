@@ -117,6 +117,9 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 - **事务边界与副作用持久化**：业务拒绝不回滚；非业务异常才回滚。凡业务事务会回滚的路径，副作用记录必须 `REQUIRES_NEW`（EOD 步骤/批次失败标记、relay 指令失败标记、缺口修复耗尽标记）。
 - **失败兜底与人工入口**：EOD 步骤失败 → `POST /api/eod/batch/{batchNo}/resume`；缺口修复用尽 → `POST /api/reconcile/diffs/{id}/resolve`；上游指令用尽 → `POST /api/upstream/commands/{id}/retry`；Kafka 超限进 DLT。
 - **重试边界**：白名单仅 `DeadlockLoserDataAccessException`、`CannotAcquireLockException`；尝试 3 次、间隔 50ms/200ms；事务内不得 catch 后重试。
+- **投递语义（至少一次）**：事件与上游指令的投递均为 **at-least-once** —— 认领租约过期后被重新认领、或"已发出但未标记 `SENT` 时进程崩溃"，都会导致**重复发送**，这是设计接受的行为，不是缺陷。事件重复由读侧幂等消化（`(aggregate_id, event_version)` 严格递增、`execution_id` 主键）；指令重复由上游按报文内幂等标识消化（SUBMIT 带 `clientOrderId`，CANCEL 带 `orderNo` + `exchangeOrderId`）。系统不做"发送前二次确认"这类会引入新竞态的补偿；重复敞口由 `relay.lease_reclaim_total{channel}` 度量，正常应为 0。
+- **`exec_seq` 契约与补拉边界**：`exec_seq` 为**订单内从 1 开始、期望连续递增**的成交序号；`ExecutionReportSource.pull(orderNo, fromSeq, limit)` 返回 **`seq >= fromSeq`**（含边界）的成交回报。上游违约（起始缺失、跳号）会被记为缺口差异（`EXEC_GAP`）并按退避补拉；"已收到序号"取"已应用 ∪ 被拒"两处之并，避免被拒成交造成幻影缺口。
+- **指标采样口径**：`upstream.command.pending`、`event.outbox.pending`、`exec.gap.open` 是**周期性采样**（默认 5s）到内存的 Gauge —— **Prometheus 抓取不产生任何数据库查询**；采样 SQL 均有索引支撑。Counter 只在事件发生时自增，无查询成本。
 
 ## 批次进度
 

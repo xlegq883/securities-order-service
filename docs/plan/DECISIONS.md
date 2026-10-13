@@ -72,6 +72,37 @@
 - **保留不变**：`t_order_query` PK `order_no`、`t_execution_query` PK `execution_id`、`t_distributed_lock` PK `lock_name`、`t_eod_batch_step` PK `step_id`；全部唯一键命名严格照规格。
 - **影响面**：`sql/V1__init.sql`；批次 2 的游标实现；批次 4 读模型 keyset。
 
+### 变更 4 · 2026-10-13 · `change_type` 扩展 `SUBMITTED`
+
+- **原决定**（见 MASTER-SPEC 事件枚举）：`change_type ∈ {ACKED, REJECTED, CANCEL_REQUESTED, CANCELED, EXPIRED, FILL_UPDATED, FILLED}`。
+- **新决定**：新增 `SUBMITTED`；下单事务把 `event_version` 置 1，并发出该版本唯一的 `ORDER_STATE_CHANGED`（快照 `status=SUBMITTED`）。
+- **理由**：原枚举缺"创建"一档，读模型没有初始行 —— "已受理但尚未收到回报"的单在查询侧不可见，直到第一次回报事件才出现，属结构性缺口。
+- **影响面**：批次 1 的下单创建与事件写入；批次 4 读模型的初始投影。
+- **未采纳的替代**：下单不发事件、靠重建补齐（会让新单在窗口内查不到）；查询侧 read-through 回填（查询路径多一段兼容逻辑且与"表与流一对一"冲突）。
+
+### 变更 5 · 2026-10-13 · 差异类型与错误码扩展，以及响应边界口径
+
+- **原决定**：差异类型 9 个取值（`ILLEGAL_TRANSITION`/`EXEC_AFTER_TERMINAL`/`EXEC_GAP`/`EXEC_OVERFILL`/`CANCEL_AFTER_FILL`/`EXEC_SUM_MISMATCH`/`READ_MODEL_DRIFT`/`UPSTREAM_SUBMIT_FAILED`/`DUPLICATE_REPORT`）；错误码 7 个；`POST /api/reports` 统一 200（未区分报文非法）。
+- **新决定**：
+  1. 差异类型新增 `ORDER_NOT_FOUND`（回读为空）、`AFTER_TERMINAL`（非成交回报晚于终态）、`DATA_CONFLICT`（同 `executionId` 落到不同订单）；
+  2. 错误码新增 `RETRY_EXHAUSTED`（503，真并发冲突重试 3 次仍失败）；
+  3. **响应边界写死**：报文/字段校验失败 → **400 `INVALID_PARAM` 且零留痕**（不插报告表、不落差异、不计 `applied/rejected`）；业务与数据拒绝 → **200 + `applied:false` + `diffType`**；事件发件箱唯一键冲突（程序缺陷）→ **500 且不进差异体系**；撤单请求的"订单不存在"→ **404**，而回报管道里的"订单不存在"→ 差异 `ORDER_NOT_FOUND`（同一语义两种出口，因一个是客户端动作、一个是上游事实）。
+- **理由**：原分类里"订单不存在"没有归属，会掉进无意义的重试（退避三轮、污染日志指标）；"晚于终态"只有部分情形被命名；用 4xx 表达业务拒绝会诱导上游重投，制造重复投递。
+- **影响面**：批次 1 的 0 行分类矩阵、差异表使用、错误码表；批次 4 的消费失败兜底沿用同一错误码体系。
+
+### 变更 6 · 2026-10-13 · 投递/差异表的认领字段、缺口扫描索引与投递语义
+
+- **原决定**：投递表 `status ∈ {PENDING, SENT, FAILED}`；差异表无重试字段；缺口扫描未规定范围与索引；投递语义未声明。
+- **新决定**：
+  1. 投递表状态扩为 `{PENDING, IN_PROGRESS, SENT, FAILED}`，并补 `owner VARCHAR(64)`、`claimed_at DATETIME(3)` —— 支撑"短事务认领 → 事务外发送 → 短事务落结果（owner 守卫）"与租约回收；
+  2. 差异表补 `attempt_count INT NOT NULL DEFAULT 0`、`next_attempt_at DATETIME(3) NULL`；
+  3. 补索引与列：`t_report_event.exec_seq BIGINT NULL` + `idx_report_exec(order_no, report_type, exec_seq)`；`t_execution.idx_exec_created(created_at, order_no)`；`t_upstream_command.idx_status_next(status, next_retry_at)`；`t_reconcile_diff.idx_diff_type_status(diff_type, status)`；
+  4. 投递语义 = **at-least-once**（租约过期重认领、或"已发出但未标 `SENT` 时崩溃"都会重复发送）；事件重复由读侧幂等消化，指令重复由上游按报文内幂等标识（`clientOrderId` / `orderNo` + `exchangeOrderId`）消化；
+  5. 发送与外部调用**一律在事务之外**；对外通道经端口（`EventPublisher` / `UpstreamCommandSender`），**中间件客户端只允许出现在其实现类中**（两个 relay 不得直接依赖 `KafkaTemplate`）。
+- **理由**：①发送若在持锁事务内，等于"长事务包着网络调用"；②缺口判定若只用 `t_execution`，被拒成交会被当成缺失序号，产生永远修不掉的幻影缺口；③`t_upstream_command` 每秒按 `status` 认领却没有索引 = 每秒全表扫；④"至少一次"必须显式声明，否则重复会被当成 bug 追。
+- **影响面**：`sql/V1__init.sql`（配合 `docker compose down -v`）；批次 1 的 relay、缺口检测/修复、差异落库；批次 3 的差异兜底；批次 4 的消费幂等前提（版本号与 `execution_id` 去重）。
+- **未采纳的替代**：把被拒成交的序号写进 `t_execution` 以避免幻影缺口（违反 D7 与对账等式）；用 `GET_LOCK` 做认领互斥（连接级锁在连接池下失效，见 D17）。
+
 ## 执行层待定项（不属技术决策，由各批执行单定稿）
 
 - 包结构目录形态（批次 0 执行单定稿：上下文在前、层在后）。

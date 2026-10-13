@@ -31,11 +31,12 @@
 
 ## 三、产出文件
 
-- **pom.xml**：parent `spring-boot-starter-parent:3.2.5`；`com.fuzuyang:securities-order-service:0.0.1-SNAPSHOT`；Java 17 + UTF-8。依赖：web、validation、spring-kafka、`mybatis-spring-boot-starter:3.0.3`、`mysql-connector-j`(runtime)、actuator、`micrometer-registry-prometheus`、lombok；测试：starter-test、spring-kafka-test、**spring-boot-testcontainers**、`org.testcontainers:mysql` + `junit-jupiter`（`testcontainers-bom` 统一版本）。**不引入 data-redis，不引入 h2**。插件：spring-boot-maven-plugin、maven-compiler-plugin(UTF-8)、**maven-failsafe-plugin**（绑定 `verify`，includes `**/*IT.java`）。
+- **pom.xml**：parent `spring-boot-starter-parent:3.2.5`；`com.fuzuyang:securities-order-service:0.0.1-SNAPSHOT`；Java 17 + UTF-8。依赖：web、validation、spring-kafka、`mybatis-spring-boot-starter:3.0.3`、`mysql-connector-j`(runtime)、actuator、`micrometer-registry-prometheus`、lombok；测试：starter-test、spring-kafka-test、**spring-boot-testcontainers**、`org.testcontainers:mysql` + `junit-jupiter`（**版本一律由 Boot 3.2.5 管理（Testcontainers 1.19.7），不显式 import `testcontainers-bom`**）。**不引入 data-redis，不引入 h2**。插件：spring-boot-maven-plugin、maven-compiler-plugin(UTF-8)、**maven-failsafe-plugin**（绑定 `verify`，includes `**/*IT.java`）。**不使用 Maven Wrapper**（CI 用 `setup-java` 的 maven 缓存）。
 - **docker-compose.yml**：`mysql:8.0`→3307（`MYSQL_DATABASE=securities`、`TZ=Asia/Shanghai`、utf8mb4、挂载 `./sql/V1__init.sql`、healthcheck、持久卷）；`apache/kafka:3.7.0`→9092（KRaft 单节点，沿用老仓库已验证 env 块、healthcheck、持久卷）；**不启 Redis**；bridge 网络。
 - **sql/V1__init.sql**：建库 + **12 张表一次建齐**（字段与唯一键以 MASTER-SPEC 为准）：`t_order`(`uk_order_no`、`uk(account_id, client_order_id)`、`idx_account_created_id`、`idx_status`)、`t_execution`(`uk_execution_id`、`idx_order_seq`)、`t_report_event`(`uk_dedupe_key`)、`t_upstream_command`(`uk(order_no, command_type)`)、`t_event_outbox`(`uk_dedupe_key`、`idx_status_next`)、`t_order_query`(PK `order_no`)、`t_execution_query`(PK `execution_id`)、`t_reconcile_diff`(`uk_dedupe_key`)、`t_eod_batch`(`uk(business_date, batch_no)`)、`t_eod_batch_step`(`uk(batch_id, step_name)`)、`t_eod_settlement`(`uk(business_date, account_id, security_code)`)、`t_distributed_lock`(PK `lock_name`)。种子仅 `t_distributed_lock` 一行 `('read_model_rebuild', NULL, NULL, NULL, NULL)`。
+  - **规格列清单遗漏的必需列（本批补齐）**：`t_order` 补 `id BIGINT UNSIGNED AUTO_INCREMENT` 主键与 `created_at DATETIME(3)` —— `idx_account_created_id` 与批次 2 游标 `(created_at, id)` 依赖它们；毫秒精度用于减少同秒 tie。同时补 `updated_at DATETIME(3) ON UPDATE CURRENT_TIMESTAMP`（排障与增量扫描需要，若不要可删）。
 - **配置**：
-  - `application.yml`：Jackson `time-zone: Asia/Shanghai`、`spring.sql.init.encoding: UTF-8`、Kafka producer `acks=all` + `max.block.ms=3000`、consumer `group-id` + `auto-offset-reset: earliest`、MyBatis `mapper-locations` + `map-underscore-to-camel-case`、`server.port=8080`、`app.*` 新键（`upstream.execution-source.enabled=false`、`outbox.{topic,partitions,relay-enabled,scan-interval-ms,batch-size,max-retries,base-backoff,max-backoff}`、`eod.{lease-seconds=60,heartbeat-seconds=15,max-attempts=3}`、`consumer.{ack-mode=MANUAL_IMMEDIATE,max-attempts=3}`、`query.source=write`、`rebuild.lock-name=read_model_rebuild`）。
+  - `application.yml`：Jackson `time-zone: Asia/Shanghai`、`spring.sql.init.encoding: UTF-8`、Kafka producer `acks=all` + `max.block.ms=3000`、consumer `group-id` + `auto-offset-reset: earliest`、MyBatis **`mapper-locations: classpath*:mapper/**/*.xml`**（必须带 `classpath*:` 才能递归扫子目录）+ `map-underscore-to-camel-case`、`server.port=8080`、`app.*` 新键（`upstream.execution-source.enabled=false`、`outbox.{partitions,relay-enabled,scan-interval-ms,batch-size,max-retries,base-backoff,max-backoff}`（**topic 名走代码常量，不进配置**）、`eod.{lease-seconds=60,heartbeat-seconds=15,max-attempts=3}`、`consumer.{ack-mode=MANUAL_IMMEDIATE,max-attempts=3}`、`query.source=write`、`rebuild.lock-name=read_model_rebuild`）。
   - `application-local.yml`：JDBC `jdbc:mysql://localhost:3307/securities?...&serverTimezone=Asia/Shanghai`、hikari `initialization-fail-timeout=-1` + `connection-timeout=3000` + `maximum-pool-size=30`、Kafka `localhost:9092`。
 - **代码骨架**（只有骨架，无业务逻辑）：`com.fuzuyang.securities.{order|execution|query|eod}.{api|application|domain|infrastructure}` + `common.{api|error|exception|config|util}`，各上下文与层建 `package-info.java` 声明依赖方向；`SecuritiesOrderServiceApplication`；`common/config/{MyBatisConfig, JacksonTimeZoneConfig, KafkaTopicConfig}`（`NewTopic` 显式创建 `order-events`、`execution-events` 及各自 `.DLT`）。
 - **CI**：`.github/workflows/verify.yml` —— ubuntu-latest + temurin 17 + maven cache，跑 `mvn -B -Dfile.encoding=UTF-8 verify`；**无 `services:` 块**（T2 用 Testcontainers，runner 自带 Docker；T3 用 EmbeddedKafka，无需容器）。
@@ -57,10 +58,19 @@
 4. `DECISIONS.md` 已有 Redis 变更记录；本执行单与实现一致。
 5. 单独一次 commit（提交信息注明"批次 0"）。
 
-## 六、假设、默认与风险
+## 六、本批定稿的执行层约定（后续批次遵循）
+
+- **包与 Mapper 约定**：Mapper 接口放 `<context>.infrastructure.mapper`（例 `com.fuzuyang.securities.order.infrastructure.mapper.OrderMapper`）；XML 放 `src/main/resources/mapper/<context>/`；`mapper-locations` 用 `classpath*:mapper/**/*.xml`。
+- **Topic 常量**：`order-events`、`execution-events` 及派生的 `<topic>.DLT` 由 `common` 下的 `EventTopics` 常量统一定义，配置只保留 `partitions`。
+- **依赖版本**：Testcontainers 与 `spring-boot-testcontainers` 版本由 Boot 3.2.5 管理，不额外 import BOM。
+- **构建与测试的执行方式**：**由实施者在会话内以提升权限直接执行** `docker compose up -d` 与 `mvn -B -Dfile.encoding=UTF-8 verify`（沙盒内网络与 Docker API 不可达，提权后实测可用：阿里云镜像 HTTP 200、Docker 29.8.0 可用且本地已有 `mysql:8.0`/`apache/kafka:3.7.0`）。实施者自行读取失败日志并修复；需要人工确认的只有"改过脚本后 `docker compose down -v` 重建卷"这类操作。
+- **无 Maven Wrapper**：使用系统 Maven 3.9.16；`.gitignore` 不再保留 wrapper 相关行。
+- **列补齐**：`t_order` 的 `id` / `created_at` / `updated_at` 按第三节执行。
+
+## 七、假设、默认与风险
 
 - Spring Boot 锁定 **3.2.5**、MyBatis 3.0.3、Lombok 保留；单模块 Maven；包结构"上下文在前、层在后"。
 - 端口：HTTP 8080、MySQL 3307、Kafka 9092；**6379 不再占用**。
-- 构建与测试必须在**本机非沙盒终端**执行（受限环境无网络、Docker API 不可达）；编码与静态自检可离线完成，`mvn verify` 结果需人工回贴。
+- 构建与测试由实施者在会话内提权执行（见第六节）；本机需保持 Docker Desktop 运行，否则 T2 失败。
 - 首次构建需联网下载依赖与镜像；Docker 未运行则 T2 失败（T2 不允许降级为 H2/mock）。
 - 本批不写业务逻辑；状态机、回报处理、日终、读模型全部留给后续批次。

@@ -50,8 +50,31 @@
 - **影响面**：批次 0–5 的验证环路（反馈闭环显著加快）；**不改变任何技术决策**。
 - **保留的例外**：改动 `sql/V1__init.sql` 后需 `docker compose down -v` 重建卷才生效（entrypoint 脚本只在数据目录为空时执行）。
 
+### 变更 3 · 2026-10-13 · 批次 0 实现期两处落地修正
+
+**覆盖 1 · Testcontainers 版本 1.19.7 → 1.21.4**
+
+- **原决定**：T2 依赖 `org.testcontainers:mysql` + `junit-jupiter`，版本由 `spring-boot-starter-parent:3.2.5` 统一管理（1.19.7），不额外 import BOM。
+- **新决定**：在 `pom.xml` 覆盖 `<testcontainers.version>1.21.4</testcontainers.version>`；**仍复用 Boot 的 `testcontainers-bom`**，只改版本属性，不新增 BOM 来源。
+- **理由**：1.19.7 内置的 docker-java 与本机 Docker Engine **29.8.0** 无法通信，T2 报 `Could not find a valid Docker environment` / `Status 400`；覆盖为 1.21.4 后 `SchemaIT` 6 个用例全绿，且无需设置 `DOCKER_HOST`。
+- **影响面**：仅 `pom.xml` 属性与 T2 测试；T1/T3 与批次 1–5 业务实现不受影响。
+- **未采纳的替代**：为本机开启 Docker TCP `2375` 或手工设 `DOCKER_HOST` —— 把环境依赖外置到个人设置，换机即坏，且不解决 1.19.7 对新引擎的兼容性。
+
+**覆盖 2 · 12 表 DDL 增量列**
+
+- **原决定**：建表字段与唯一键以 MASTER-SPEC 的列清单为准（部分表未列代理主键与 `created_at`）。
+- **新决定**：
+  1. 各写表（`t_order`、`t_execution`、`t_report_event`、`t_upstream_command`、`t_event_outbox`、`t_reconcile_diff`、`t_eod_batch`、`t_eod_settlement`）增加代理主键 `id BIGINT UNSIGNED AUTO_INCREMENT`；
+  2. 写表统一增加 `created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)`；
+  3. `t_order_query` 增加 `created_at` 与 `idx_account_created(account_id, created_at, order_no)`；
+  4. `t_order` 的 `id` 兼作 keyset 分页排序键（对应 `idx_account_created_id`）。
+- **理由**：`t_order` 的 `idx_account_created_id` 与批次 2 游标 `(created_at, id)` 本就隐含这两列必须存在；`DATETIME(3)` 毫秒精度是游标 `created_at_epoch_ms` "不丢同毫秒行"的前提；其余写表加代理主键与 `created_at` 是低风险的通用惯例，便于排查与后续 keyset。
+- **保留不变**：`t_order_query` PK `order_no`、`t_execution_query` PK `execution_id`、`t_distributed_lock` PK `lock_name`、`t_eod_batch_step` PK `step_id`；全部唯一键命名严格照规格。
+- **影响面**：`sql/V1__init.sql`；批次 2 的游标实现；批次 4 读模型 keyset。
+
 ## 执行层待定项（不属技术决策，由各批执行单定稿）
 
 - 包结构目录形态（批次 0 执行单定稿：上下文在前、层在后）。
 - compose 细节、CI 写法、failsafe 命名约定（批次 0 执行单定稿）。
+- Mapper 约定（批次 0 定稿）：接口放 `<context>.infrastructure.mapper`，XML 放 `src/main/resources/mapper/<context>/`，`mapper-locations=classpath*:mapper/**/*.xml`；事件 topic 名走代码常量 `EventTopics`，不做配置化。
 - 游标编码格式、列表过滤参数集合、返回 DTO 形态（批次 2 执行单定稿）。

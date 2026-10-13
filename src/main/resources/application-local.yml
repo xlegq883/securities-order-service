@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3307/securities?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 启动期不因数据库未就绪而失败（T1 上下文加载依赖此项）
+      initialization-fail-timeout: -1
+      connection-timeout: 3000
+      maximum-pool-size: 30
+
+  kafka:
+    bootstrap-servers: localhost:9092

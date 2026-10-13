@@ -1,0 +1,24 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      # 唯一验收命令；T1+T2+T3 三层全部默认执行。
+      # 无 services: 块 —— T2 用 Testcontainers（runner 自带 Docker），T3 用 EmbeddedKafka（无需容器）。
+      - name: mvn verify
+        run: mvn -B -Dfile.encoding=UTF-8 verify

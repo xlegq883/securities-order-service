@@ -1,0 +1,80 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: securities-order-service
+
+  # 全链路时区：Asia/Shanghai
+  jackson:
+    time-zone: Asia/Shanghai
+
+  sql:
+    init:
+      encoding: UTF-8
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all
+      max-block-ms: 3000
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    consumer:
+      group-id: securities-order-service
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    admin:
+      fail-fast: false
+
+mybatis:
+  # classpath*: 才能递归扫描子目录（XML 放 resources/mapper/<context>/）
+  mapper-locations: classpath*:mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+app:
+  upstream:
+    execution-source:
+      # 缺口修复端口默认关闭（测试用 Stub，运行时可切 Http）
+      enabled: false
+
+  outbox:
+    # topic 名走代码常量 EventTopics，不做配置化（见 Q4）；此处只保留分区数
+    partitions: 3
+    relay-enabled: true
+    scan-interval-ms: 1000
+    batch-size: 100
+    max-retries: 3
+    base-backoff: 200ms
+    max-backoff: 5s
+
+  eod:
+    lease-seconds: 60
+    heartbeat-seconds: 15
+    max-attempts: 3
+
+  consumer:
+    ack-mode: MANUAL_IMMEDIATE
+    max-attempts: 3
+
+  query:
+    # 批次 2 先查写表；批次 4 读模型建成后默认切到 read
+    source: write
+
+  rebuild:
+    lock-name: read_model_rebuild

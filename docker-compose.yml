@@ -1,0 +1,76 @@
+# 本地依赖编排：MySQL(3307) / Kafka(9092)
+# 注意（决策变更 1）：不再引入 Redis，6379 不占用。
+# 注意（决策 D22）：SQL 只有一份单一来源 sql/V1__init.sql，compose 与 Testcontainers 引用同一路径。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sos-mysql
+    restart: unless-stopped
+    ports:
+      # 本机 3306 已被原生 MySQL 占用，固定映射到 3307
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: securities
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    volumes:
+      - ./sql/V1__init.sql:/docker-entrypoint-initdb.d/V1__init.sql:ro
+      - sos-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - sos-net
+
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: sos-kafka
+    # 显式 hostname：KRaft controller 启动时会调用 InetAddress.getLocalHost() 解析
+    # 通配监听地址，容器默认 hostname（容器 ID）在部分 Docker Desktop 网络下无法解析。
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      TZ: Asia/Shanghai
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # topic 由应用通过 NewTopic 显式创建
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - sos-kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    networks:
+      - sos-net
+
+volumes:
+  sos-mysql-data:
+  sos-kafka-data:
+
+networks:
+  sos-net:
+    driver: bridge

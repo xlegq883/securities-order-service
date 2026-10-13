@@ -103,6 +103,40 @@
 - **影响面**：`sql/V1__init.sql`（配合 `docker compose down -v`）；批次 1 的 relay、缺口检测/修复、差异落库；批次 3 的差异兜底；批次 4 的消费幂等前提（版本号与 `execution_id` 去重）。
 - **未采纳的替代**：把被拒成交的序号写进 `t_execution` 以避免幻影缺口（违反 D7 与对账等式）；用 `GET_LOCK` 做认领互斥（连接级锁在连接池下失效，见 D17）。
 
+### 变更 7 · 2026-10-13 · 批次 1 实现期六处落地修正
+
+**覆盖 1 · 投递组件落在 `order` 上下文**
+- **原决定**（batch-1 §四）：`EventWriter`/`EventOutboxRelay`/`UpstreamCommandRelay` 与 `application/port/{EventPublisher, UpstreamCommandSender}`、`LoggingUpstreamCommandSender` 归到 execution 侧。
+- **新决定**：投递（两个 relay、`EventWriter`、两个端口、`Kafka/Logging` 出站、`t_event_outbox`/`t_upstream_command` 的 DO 与 Mapper）全部落在 **order** 上下文；execution 只保留 `ExecutionReportSource` 端口与 Noop。
+- **理由**：execution 已经依赖 order（回报分发调用 order 的处理器、CAS、EventWriter）；若投递端口按原清单放在 execution，order 的下单/撤单路径写指令行就得反向依赖 execution，形成上下文环，违反 D1"依赖单向"。投递方向固定为 execution → order。
+
+**覆盖 2 · 写路径隔离级别固定 `READ_COMMITTED`**
+- **原决定**：仅规定成交应用事务隔离 `READ_COMMITTED`（MASTER-SPEC），未规定下单等路径。
+- **新决定**：数据源默认隔离级别整体设为 `READ_COMMITTED`（`spring.datasource.hikari.transaction-isolation`），写路径全部适用。
+- **理由**：MySQL 默认 `REPEATABLE READ` 下，下单冲突后的"回查区分两个唯一键"读到的是事务开始时的旧快照 → 看不到并发已提交的同幂等键订单 → 误判为订单号碰撞，重试 3 次后返回 503（T2 并发下单用例实测复现）。`READ_COMMITTED` 让每条语句取最新已提交快照，回查才成立。
+
+**覆盖 3 · 退避时间由数据库时钟计算**
+- **原决定**：退避写 `next_retry_at`/`next_attempt_at`，由应用计算时间戳。
+- **新决定**：投递与缺口修复的退避一律用 `DATE_ADD(NOW(3), INTERVAL ? ...)`（数据库时钟）；插入 PENDING 行时 `next_retry_at` 置 NULL（认领 SQL 已容忍 NULL 表示"立即可认领"）。
+- **理由**：应用墙钟与数据库时钟/时区不一致时，`next_retry_at` 会落在将来或过去（Testcontainers 默认 UTC 库 + 上海应用实测导致认领永远命中不到）。改用数据库时钟后与库时区解耦。
+
+**覆盖 4 · 重试白名单新增 `RetryableDispatchException`，且非白名单耗尽不映射 503**
+- **原决定**：白名单仅 `DeadlockLoserDataAccessException`/`CannotAcquireLockException`。
+- **新决定**：白名单增加应用级 `RetryableDispatchException`（0 行分类矩阵兜底分支，batch-1 §3.4）；`RetryTemplate` 的 recovery 回调只在"最后异常属白名单"时映射 `RETRY_EXHAUSTED`，否则原样抛出。
+- **理由**：§3.4 要求矩阵未覆盖时"外层重试 ≤3 次、耗尽 → 503"，必须有可重试的异常类型；而 `RetryTemplate` 对"不可重试异常"同样会调用 recovery 回调，若不区分会把业务异常误映射成 503。
+
+**覆盖 5 · 测试库时区与 compose 对齐**
+- **新决定**：`AbstractMySqlIT` 给 Testcontainers MySQL 传 `--default-time-zone=+08:00`（含字符集参数）。
+- **理由**：Testcontainers 默认库时区为 UTC，`NOW(3)` 与上海应用时钟相差 8 小时，使时间相关的认领/缺口判定失真（覆盖 2/3 的根因之一）。测试环境必须与 compose 同为 Asia/Shanghai。
+
+**覆盖 6 · 指令投递参数显式化**
+- **新决定**：`app.upstream` 增 `scan-interval-ms=1000`、`batch-size=100`、`send-timeout-ms=3000`、`claim-lease-seconds=600`（与 outbox 同构，含 `lease > batch × timeout` 启动校验）；另增 `app.metrics.sample-interval-ms=5000`、`app.execution-conflict.precheck-enabled=true`。
+- **理由**：指令投递与事件投递同为三阶段/至少一次，需同等的批大小、超时与租约参数与校验，复用 outbox 配置会掩盖两者的独立调参需求。
+
+**覆盖 7 · T2/T3 共用单例 MySQL 容器 + profile 下放**
+- **新决定**：`AbstractMySqlIT` 不再用 `@Testcontainers`/`@Container`，改为静态初始化里 `MYSQL.start()` 一次、JVM 退出时停止的**进程内单例**容器（仍保留 `@ServiceConnection`）；`@ActiveProfiles` 从基类下放到各测试类（T2 = `test`，T3 = `test-kafka`）。
+- **理由**：`@Container` 静态字段在基类时，所有子类共用同一容器对象，而 `@Testcontainers` 在**每个测试类结束时停止**它；Spring 上下文缓存又可能在下一个类复用旧 DataSource → 后续用例连到已停容器（实测 `CannotCreateTransactionException`）。另外 `@ActiveProfiles` 是**合并**语义，基类声明 `test` 会与子类 `test-kafka` 叠加，使 T3 也被排除 Kafka 自动配置。共享单例容器还要求用例对跨类数据自隔离（relay/事件用例在 `@BeforeEach` 清空投递表；其余断言按订单维度）。
+
 ## 执行层待定项（不属技术决策，由各批执行单定稿）
 
 - 包结构目录形态（批次 0 执行单定稿：上下文在前、层在后）。

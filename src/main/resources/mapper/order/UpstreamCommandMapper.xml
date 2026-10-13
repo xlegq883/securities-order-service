@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.fuzuyang.securities.order.infrastructure.mapper.UpstreamCommandMapper">
+
+    <insert id="insert" parameterType="com.fuzuyang.securities.order.infrastructure.entity.UpstreamCommandDO">
+        INSERT INTO t_upstream_command (order_no, command_type, transport, payload, status, attempt_count,
+                                        next_retry_at, owner, claimed_at, last_error)
+        VALUES (#{orderNo}, #{commandType}, #{transport}, #{payload}, #{status}, #{attemptCount},
+                #{nextRetryAt}, #{owner}, #{claimedAt}, #{lastError})
+    </insert>
+
+    <select id="selectByOrderNoAndType" resultType="com.fuzuyang.securities.order.infrastructure.entity.UpstreamCommandDO">
+        SELECT * FROM t_upstream_command WHERE order_no = #{orderNo} AND command_type = #{commandType}
+    </select>
+
+    <select id="selectClaimable" resultType="com.fuzuyang.securities.order.infrastructure.entity.UpstreamCommandDO">
+        SELECT * FROM t_upstream_command
+        WHERE (status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at &lt;= NOW(3)))
+           OR (status = 'IN_PROGRESS' AND claimed_at &lt; NOW(3) - INTERVAL #{leaseSeconds} SECOND)
+        ORDER BY id
+        LIMIT #{limit}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <update id="markInProgress">
+        UPDATE t_upstream_command
+        SET status = 'IN_PROGRESS', owner = #{owner}, claimed_at = NOW(3)
+        WHERE id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">#{id}</foreach>
+    </update>
+
+    <update id="markSent">
+        UPDATE t_upstream_command
+        SET status = 'SENT'
+        WHERE id = #{id} AND owner = #{owner} AND status = 'IN_PROGRESS'
+    </update>
+
+    <update id="markFailed">
+        UPDATE t_upstream_command
+        SET status = #{status}, attempt_count = #{attemptCount},
+            next_retry_at = DATE_ADD(NOW(3), INTERVAL #{backoffMicros} MICROSECOND),
+            last_error = #{lastError}, owner = NULL
+        WHERE id = #{id} AND owner = #{owner} AND status = 'IN_PROGRESS'
+    </update>
+</mapper>

@@ -103,9 +103,16 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 - **CAS 判定口径**：分支只以 **CAS①**（累加 UPDATE）受影响行数为准；**CAS②（状态推导）的 0 行是正常自环**，仍返回 `applied:true`。
 - **回报接口响应**：`POST /api/reports` 统一 200，响应体 `{orderNo, applied, diffType?, filledQuantity, status}`。业务拒绝走正常提交（不回滚），报告与差异同事务提交。
 - **事件唯一性**：`order-events` 上每个 `(order_no, event_version)` **恰好一条** `ORDER_STATE_CHANGED`（性质放 `change_type`）；`execution-events` 每版本至多一条 `EXECUTION_APPLIED`。**同一事务可产出“同版本、跨 topic”两条事件**（order + execution），不违反“一事务一版本”。
-- **`change_type`**：`ACKED`、`REJECTED`、`CANCEL_REQUESTED`、`CANCELED`、`EXPIRED`、`FILL_UPDATED`、`FILLED`；只服务日志/指标/排查，不参与读侧排序与去重。
+- **`change_type`**：`SUBMITTED`（下单创建，决策变更 4）、`ACKED`、`REJECTED`、`CANCEL_REQUESTED`、`CANCELED`、`EXPIRED`、`FILL_UPDATED`（部分成交自环）、`FILLED`（累计到量）；只服务日志/指标/排查，不参与读侧排序与去重。
 - **去重键**：成交类 `EXECUTION:{order_no}:{execution_id}`；订单回报与撤单确认类 `{report_type}:{order_no}:{exchange_seq}`；事件去重键 `{order_no}:{event_version}:ORDER_STATE_CHANGED` 与 `{order_no}:{event_version}:EXECUTION_APPLIED:{execution_id}`。
-- **下单幂等**：`uk(account_id, client_order_id)`；参数一致 → 200 返回原订单；不一致 → 409 `IDEMPOTENT_REPLAY_CONFLICT`。
+- **下单幂等**：`uk(account_id, client_order_id)`；参数一致 → 200 返回原订单；不一致 → 409 `IDEMPOTENT_REPLAY_CONFLICT`。幂等命中响应（下单与撤单）带 `upstreamCommandStatus`。
+  - `order_no` 由服务端生成（`O + yyyyMMddHHmmssSSS + 6 位随机`）；**唯一性由 `uk_order_no` 保证**，生成器只降低碰撞率。`INSERT` 冲突后**回查区分两个唯一键**：命中账户幂等键 → 幂等分支；否则视为订单号碰撞 → 重新生成（最多 3 次，耗尽 → 503 `RETRY_EXHAUSTED`），并计 `order_order_no_collision_total`。
+  - `LIMIT` 必带正数 `orderPrice`，`amount = orderPrice × quantity`；`MARKET` 的 `order_price` 与 `amount` 均为 NULL（成交金额与委托金额解耦）。
+- **成交序号契约**：`exec_seq` 为订单内**从 1 起、期望连续递增**的成交序号；缺口检测与补拉只依赖它，`exec_seq` **不作准入门槛**（累加可交换）。
+- **投递 relay**：事件与上游指令均"短事务认领（`IN_PROGRESS` + owner + 租约）→ **事务外**发送 → owner 守卫落结果（`SENT`/退避回 `PENDING`/达上限 `FAILED`）"。语义 = **at-least-once**；`SENT` 仅表示"已交给出站通道"，不代表上游受理。出站经端口（`EventPublisher`/`UpstreamCommandSender`），relay 不直接依赖 Kafka 客户端。硬约束 `claim-lease-seconds > batch-size × send-timeout-ms`（启动期校验）。
+- **缺口检测与修复**："已收到序号" = 已应用 ∪ 被拒；内部缺口（`minMissing > minSeen` 且 `max - minMissing >= grace-count`）或时间条件（无新回报 ≥ `grace-seconds`）触发；多洞只报最小。补拉**复用实时回报同一入口**（`source=PULL`）；端口关闭时缺口保持 `OPEN`（由 Gauge 暴露），达 `repair-max-attempts` → `FAILED`。
+- **响应边界**：报文/字段校验失败 → 400 `INVALID_PARAM` 且**零留痕**（不插报告表/不落差异/不计 applied-rejected）；业务/数据拒绝 → 200 + `applied:false` + `diffType`；撤单请求"订单不存在"→ 404，而回报管道里"订单不存在"→ 差异 `ORDER_NOT_FOUND`；真并发重试耗尽 → 503 `RETRY_EXHAUSTED`；发件箱唯一键冲突（程序缺陷）→ 500 且不进差异体系。
+- **本批指标**：Counter 计入 `AppMetrics`（点号名不带 `_total`，导出名由断言钉住）：`order_created_total`、`order_idempotent_replay_total`、`order_order_no_collision_total`、`report_applied_total`、`report_rejected_total{diff_type}`、`report_invalid_total{reason}`、`exec_dup_total`、`exec_overfill_total`、`exec_after_terminal_total`、`illegal_transition_total`、`state_transition_total`、`state_unchanged_total`、`cancel_request_total`、`cancel_not_cancelable_total`、`exec_gap_total`、`exec_gap_repair_exhausted_total`、`retry_attempt_total`、`retry_exhausted_total`、`relay_lease_reclaim_total{channel}`、`upstream_command_sent_total`、`upstream_command_failed_total`、`event_outbox_sent_total`。Gauge（周期采样、抓取不查库）：`upstream_command_pending`、`event_outbox_pending`、`exec_gap_open`。
 - **撤单**：仅 `ACKNOWLEDGED`/`PARTIALLY_FILLED` 可撤；`SUBMITTED` 与终态返回 `ORDER_NOT_CANCELABLE` 且不写 `cancel_requested_at`；重复撤单幂等成功；不引入“撤单中”状态。
 - **读模型**：表与流一对一。`t_order_query` 由 `order-events` + 水位线驱动；`t_execution_query` 由 `execution-events` + `execution_id` 驱动且无水位线。跨流无顺序保证，只影响两表相对可见性。
 - **锁策略**：跨事务长锁用 `t_distributed_lock`（owner + 租约 + CAS + owner 守卫释放），**禁用 `GET_LOCK`**；事务内短锁用 `SELECT ... FOR UPDATE SKIP LOCKED`。
@@ -126,7 +133,7 @@ mvn verify                # 唯一验收命令：T1 + T2 + T3 全部真实执行
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | 0 | 脚手架：仓库/模块/compose（MySQL 3307、Kafka，`TZ=Asia/Shanghai`）/CI/README + 测试基建 | ✅ 已完成 |
-| 1 | 状态机、成交累加与状态推导、事件写入、缺口端口、撤单、下单幂等、上游指令与 relay | ⏳ 待开工 |
+| 1 | 状态机、成交累加与状态推导、事件写入、缺口端口、撤单、下单幂等、上游指令与 relay | ✅ 已完成 |
 | 2 | 查询与游标分页 | ⏳ 待开工 |
 | 3 | 日终：编排与租约接管、逐单过期、结算 upsert、一致性校验、失败终态与人工续跑 | ⏳ 待开工 |
 | 4 | 读模型：消费、去重口径、位点与 DLT、重建五步、对账与失败兜底 | ⏳ 待开工 |

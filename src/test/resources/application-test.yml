@@ -1,0 +1,17 @@
+spring:
+  autoconfigure:
+    # T2 只连真库，不连 Kafka
+    exclude: org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+app:
+  outbox:
+    publisher: LOG
+    relay-enabled: false
+  upstream:
+    command-relay-enabled: false
+    command-transport: LOG
+  gap:
+    scan-enabled: false
+  metrics:
+    # 采样间隔设长，避免干扰用例（需要采样时手动调用 sample()）
+    sample-interval-ms: 600000

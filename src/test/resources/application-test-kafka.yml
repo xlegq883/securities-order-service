@@ -1,0 +1,23 @@
+spring:
+  # bootstrap-servers 由 @EmbeddedKafka(bootstrapServersProperty="spring.kafka.bootstrap-servers") 注入
+  kafka:
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+  task:
+    scheduling:
+      pool:
+        size: 4
+
+app:
+  outbox:
+    publisher: KAFKA
+    relay-enabled: false
+  upstream:
+    command-relay-enabled: false
+    command-transport: LOG
+  gap:
+    scan-enabled: false
+  metrics:
+    sample-interval-ms: 600000

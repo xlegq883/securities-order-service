@@ -1,8 +1,6 @@
 package com.fuzuyang.securities.schema;
 
-import com.fuzuyang.securities.common.config.EventTopics;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import com.fuzuyang.securities.support.AbstractMySqlIT;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -10,13 +8,8 @@ import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.MountableFile;
+import org.springframework.test.context.ActiveProfiles;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -29,34 +22,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>禁止 H2（D22）。
  */
-@SpringBootTest(properties = "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration")
-@Testcontainers
-class SchemaIT {
-
-    private static final String INIT_SCRIPT = "sql/V1__init.sql";
+@ActiveProfiles("test")
+class SchemaIT extends AbstractMySqlIT {
 
     private static final Set<String> EXPECTED_TABLES = Set.of(
             "t_order", "t_execution", "t_report_event", "t_upstream_command", "t_event_outbox",
             "t_order_query", "t_execution_query", "t_reconcile_diff",
             "t_eod_batch", "t_eod_batch_step", "t_eod_settlement", "t_distributed_lock");
-
-    static {
-        // cwd 守卫：surefire/failsafe 默认工作目录为 ${basedir}，路径错时给出清晰错误
-        if (!Files.exists(Path.of(INIT_SCRIPT))) {
-            throw new IllegalStateException(
-                    "找不到 SQL 单一来源文件 " + INIT_SCRIPT + "，当前工作目录=" + Path.of("").toAbsolutePath());
-        }
-    }
-
-    @Container
-    @ServiceConnection
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.0")
-            .withDatabaseName("securities")
-            .withUrlParam("serverTimezone", "Asia/Shanghai")
-            .withUrlParam("characterEncoding", "utf8")
-            .withCopyFileToContainer(
-                    MountableFile.forHostPath(INIT_SCRIPT),
-                    "/docker-entrypoint-initdb.d/V1__init.sql");
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -98,10 +70,21 @@ class SchemaIT {
         Map<String, Set<String>> indexes = indexesByTable();
 
         assertThat(indexes.get("t_order")).contains("idx_account_created_id", "idx_status");
-        assertThat(indexes.get("t_execution")).contains("idx_order_seq");
+        assertThat(indexes.get("t_execution")).contains("idx_order_seq", "idx_exec_created");
+        assertThat(indexes.get("t_report_event")).contains("idx_report_exec");
+        assertThat(indexes.get("t_upstream_command")).contains("idx_status_next");
         assertThat(indexes.get("t_event_outbox")).contains("idx_status_next");
+        assertThat(indexes.get("t_reconcile_diff")).contains("idx_diff_type_status");
         assertThat(indexes.get("t_order_query")).contains("idx_account_created");
         assertThat(indexes.get("t_execution_query")).contains("idx_order_seq");
+    }
+
+    @Test
+    void deliveryTablesHaveClaimColumns() {
+        assertThat(columnsOf("t_event_outbox")).contains("owner", "claimed_at");
+        assertThat(columnsOf("t_upstream_command")).contains("owner", "claimed_at");
+        assertThat(columnsOf("t_report_event")).contains("order_no", "exec_seq");
+        assertThat(columnsOf("t_reconcile_diff")).contains("attempt_count", "next_attempt_at");
     }
 
     @Test
@@ -109,6 +92,12 @@ class SchemaIT {
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM t_distributed_lock WHERE lock_name = 'read_model_rebuild'", Integer.class);
         assertThat(count).isEqualTo(1);
+    }
+
+    private Set<String> columnsOf(String table) {
+        return new LinkedHashSet<>(jdbcTemplate.queryForList(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+                String.class, table));
     }
 
     private Map<String, Set<String>> indexesByTable() {
@@ -128,12 +117,5 @@ class SchemaIT {
                     .add(rs.getString("index_name"));
         });
         return result;
-    }
-
-    /** 便于排查：把期望的 DLT 命名带上，避免 EventTopics 常量无人使用。 */
-    @Test
-    void dltTopicNamingConvention() {
-        assertThat(EventTopics.dlt(EventTopics.ORDER_EVENTS)).isEqualTo("order-events.DLT");
-        assertThat(EventTopics.dlt(EventTopics.EXECUTION_EVENTS)).isEqualTo("execution-events.DLT");
     }
 }

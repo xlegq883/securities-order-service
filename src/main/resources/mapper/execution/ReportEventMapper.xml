@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.fuzuyang.securities.execution.infrastructure.mapper.ReportEventMapper">
+
+    <insert id="insert" parameterType="com.fuzuyang.securities.execution.infrastructure.entity.ReportEventDO">
+        INSERT INTO t_report_event (report_type, order_no, dedupe_key, exchange_order_id, exchange_seq,
+                                    execution_id, exec_seq, source, applied, payload)
+        VALUES (#{reportType}, #{orderNo}, #{dedupeKey}, #{exchangeOrderId}, #{exchangeSeq},
+                #{executionId}, #{execSeq}, #{source}, #{applied}, #{payload})
+    </insert>
+
+    <update id="markAppliedZero">
+        UPDATE t_report_event SET applied = 0 WHERE dedupe_key = #{dedupeKey}
+    </update>
+
+    <select id="selectReceivedSeqs" resultType="long">
+        SELECT exec_seq FROM t_execution WHERE order_no = #{orderNo}
+        UNION
+        SELECT exec_seq FROM t_report_event
+        WHERE order_no = #{orderNo} AND report_type = 'EXECUTION' AND exec_seq IS NOT NULL
+    </select>
+
+    <select id="selectLastExecutionReportAt" resultType="java.time.LocalDateTime">
+        SELECT MAX(created_at) FROM t_report_event
+        WHERE order_no = #{orderNo} AND report_type = 'EXECUTION'
+    </select>
+</mapper>

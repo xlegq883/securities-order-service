@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.fuzuyang.securities.execution.infrastructure.mapper.ExecutionMapper">
+
+    <insert id="insert" parameterType="com.fuzuyang.securities.execution.infrastructure.entity.ExecutionDO">
+        INSERT INTO t_execution (execution_id, order_no, exec_seq, exec_quantity, exec_price, exec_amount,
+                                 exec_time, business_date)
+        VALUES (#{executionId}, #{orderNo}, #{execSeq}, #{execQuantity}, #{execPrice}, #{execAmount},
+                #{execTime}, #{businessDate})
+    </insert>
+
+    <select id="selectOrderNoByExecutionId" resultType="string">
+        SELECT order_no FROM t_execution WHERE execution_id = #{executionId} LIMIT 1
+    </select>
+
+    <select id="selectDrivingOrders" resultType="string">
+        SELECT DISTINCT order_no FROM t_execution
+        WHERE created_at &gt;= NOW(3) - INTERVAL #{windowSeconds} SECOND
+        LIMIT #{limit}
+    </select>
+</mapper>

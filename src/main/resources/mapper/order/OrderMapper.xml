@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.fuzuyang.securities.order.infrastructure.mapper.OrderMapper">
+
+    <!-- created_at 由数据库默认值填充（不显式写 NULL） -->
+    <insert id="insert" parameterType="com.fuzuyang.securities.order.infrastructure.entity.OrderDO">
+        INSERT INTO t_order (order_no, account_id, security_code, side, order_type, order_price, quantity, amount,
+                             filled_quantity, filled_amount, last_exec_seq, event_version, status, business_date,
+                             exchange_order_id, cancel_requested_at, client_order_id)
+        VALUES (#{orderNo}, #{accountId}, #{securityCode}, #{side}, #{orderType}, #{orderPrice}, #{quantity}, #{amount},
+                #{filledQuantity}, #{filledAmount}, #{lastExecSeq}, #{eventVersion}, #{status}, #{businessDate},
+                #{exchangeOrderId}, #{cancelRequestedAt}, #{clientOrderId})
+    </insert>
+
+    <select id="selectByOrderNo" resultType="com.fuzuyang.securities.order.infrastructure.entity.OrderDO">
+        SELECT * FROM t_order WHERE order_no = #{orderNo}
+    </select>
+
+    <select id="selectByAccountAndClientId" resultType="com.fuzuyang.securities.order.infrastructure.entity.OrderDO">
+        SELECT * FROM t_order WHERE account_id = #{accountId} AND client_order_id = #{clientOrderId}
+    </select>
+
+    <update id="markAcked">
+        UPDATE t_order
+        SET status = 'ACKNOWLEDGED',
+            exchange_order_id = #{exchangeOrderId},
+            event_version = event_version + 1
+        WHERE order_no = #{orderNo}
+          AND status = 'SUBMITTED'
+    </update>
+
+    <update id="markRejected">
+        UPDATE t_order
+        SET status = 'REJECTED',
+            event_version = event_version + 1
+        WHERE order_no = #{orderNo}
+          AND status = 'SUBMITTED'
+    </update>
+
+    <!-- CAS①：只累加量额并 bump 一次版本；WHERE 用旧值判容量与状态 -->
+    <update id="applyExecution">
+        UPDATE t_order
+        SET filled_quantity = filled_quantity + #{quantity},
+            filled_amount = filled_amount + #{amount},
+            last_exec_seq = GREATEST(COALESCE(last_exec_seq, 0), #{execSeq}),
+            event_version = event_version + 1
+        WHERE order_no = #{orderNo}
+          AND status IN ('ACKNOWLEDGED', 'PARTIALLY_FILLED')
+          AND filled_quantity + #{quantity} &lt;= quantity
+    </update>
+
+    <!-- CAS②：只推导状态，不 bump 版本；0 行是正常自环 -->
+    <update id="deriveStatus">
+        UPDATE t_order
+        SET status = CASE WHEN filled_quantity = quantity THEN 'FILLED' ELSE 'PARTIALLY_FILLED' END
+        WHERE order_no = #{orderNo}
+          AND status IN ('ACKNOWLEDGED', 'PARTIALLY_FILLED')
+          AND status &lt;&gt; CASE WHEN filled_quantity = quantity THEN 'FILLED' ELSE 'PARTIALLY_FILLED' END
+    </update>
+
+    <update id="requestCancel">
+        UPDATE t_order
+        SET cancel_requested_at = NOW(3),
+            event_version = event_version + 1
+        WHERE order_no = #{orderNo}
+          AND status IN ('ACKNOWLEDGED', 'PARTIALLY_FILLED')
+          AND cancel_requested_at IS NULL
+    </update>
+
+    <update id="confirmCancel">
+        UPDATE t_order
+        SET status = 'CANCELED',
+            event_version = event_version + 1
+        WHERE order_no = #{orderNo}
+          AND status IN ('ACKNOWLEDGED', 'PARTIALLY_FILLED')
+          AND filled_quantity &lt; quantity
+    </update>
+</mapper>

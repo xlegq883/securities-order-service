@@ -64,6 +64,12 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
+        <!-- 外层重试（事务之外的跨 Bean 重试） -->
+        <dependency>
+            <groupId>org.springframework.retry</groupId>
+            <artifactId>spring-retry</artifactId>
+        </dependency>
+
         <!-- 指标 -->
         <dependency>
             <groupId>io.micrometer</groupId>

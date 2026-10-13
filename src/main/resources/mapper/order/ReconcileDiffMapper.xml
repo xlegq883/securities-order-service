@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.fuzuyang.securities.order.infrastructure.mapper.ReconcileDiffMapper">
+
+    <insert id="upsert" parameterType="com.fuzuyang.securities.order.infrastructure.entity.ReconcileDiffDO">
+        INSERT INTO t_reconcile_diff (business_date, order_no, diff_type, detail, dedupe_key, status,
+                                      attempt_count, next_attempt_at, resolved_at)
+        VALUES (#{businessDate}, #{orderNo}, #{diffType}, #{detail}, #{dedupeKey}, #{status},
+                #{attemptCount}, #{nextAttemptAt}, #{resolvedAt})
+        ON DUPLICATE KEY UPDATE dedupe_key = dedupe_key
+    </insert>
+
+    <select id="selectByDedupeKey" resultType="com.fuzuyang.securities.order.infrastructure.entity.ReconcileDiffDO">
+        SELECT * FROM t_reconcile_diff WHERE dedupe_key = #{dedupeKey}
+    </select>
+
+    <select id="selectRepairableGaps" resultType="com.fuzuyang.securities.order.infrastructure.entity.ReconcileDiffDO">
+        SELECT * FROM t_reconcile_diff
+        WHERE diff_type = 'EXEC_GAP'
+          AND status = 'OPEN'
+          AND (next_attempt_at IS NULL OR next_attempt_at &lt;= NOW(3))
+        ORDER BY id
+        LIMIT #{limit}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <update id="markGapResolved">
+        UPDATE t_reconcile_diff SET status = 'RESOLVED', resolved_at = NOW(3) WHERE id = #{id}
+    </update>
+
+    <update id="markGapClaimed">
+        UPDATE t_reconcile_diff SET next_attempt_at = DATE_ADD(NOW(3), INTERVAL 60 SECOND) WHERE id = #{id}
+    </update>
+
+    <update id="markGapDeferred">
+        UPDATE t_reconcile_diff
+        SET attempt_count = #{attemptCount}, status = 'OPEN',
+            next_attempt_at = DATE_ADD(NOW(3), INTERVAL #{backoffSeconds} SECOND)
+        WHERE id = #{id}
+    </update>
+
+    <update id="markGapFailed">
+        UPDATE t_reconcile_diff
+        SET attempt_count = #{attemptCount}, next_attempt_at = NULL, status = 'FAILED'
+        WHERE id = #{id}
+    </update>
+
+    <select id="countOpenGaps" resultType="long">
+        SELECT COUNT(*) FROM t_reconcile_diff WHERE diff_type = 'EXEC_GAP' AND status = 'OPEN'
+    </select>
+</mapper>

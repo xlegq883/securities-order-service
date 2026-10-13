@@ -5,6 +5,12 @@ spring:
   application:
     name: securities-order-service
 
+  # 调度隔离：relay 长批次不得饿死指标采样与缺口扫描
+  task:
+    scheduling:
+      pool:
+        size: 4
+
   # 全链路时区：Asia/Shanghai
   jackson:
     time-zone: Asia/Shanghai
@@ -12,6 +18,12 @@ spring:
   sql:
     init:
       encoding: UTF-8
+
+  # 写路径隔离级别：分支判定依赖"冲突后回查"能看到并发已提交行
+  # （MySQL 默认 REPEATABLE READ 会让回查读到旧快照 → 误判订单号碰撞）
+  datasource:
+    hikari:
+      transaction-isolation: TRANSACTION_READ_COMMITTED
 
   kafka:
     bootstrap-servers: localhost:9092
@@ -52,6 +64,14 @@ app:
     execution-source:
       # 缺口修复端口默认关闭（测试用 Stub，运行时可切 Http）
       enabled: false
+    # 指令投递定时（测试中关闭，手动 runOnce()）
+    command-relay-enabled: true
+    # 指令出站通道：LOG | HTTP | GRPC（同时决定装配的 sender 与落库的 transport）
+    command-transport: LOG
+    scan-interval-ms: 1000
+    batch-size: 100
+    send-timeout-ms: 3000
+    claim-lease-seconds: 600
 
   outbox:
     # topic 名走代码常量 EventTopics，不做配置化（见 Q4）；此处只保留分区数
@@ -62,6 +82,30 @@ app:
     max-retries: 3
     base-backoff: 200ms
     max-backoff: 5s
+    # 出站通道：KAFKA | LOG
+    publisher: KAFKA
+    # 单条发送超时（毫秒）
+    send-timeout-ms: 3000
+    # 认领租约（秒），必须 > batch-size × send-timeout-ms / 1000（启动期 @AssertTrue 校验）
+    claim-lease-seconds: 600
+
+  gap:
+    scan-enabled: true
+    scan-interval-ms: 10000
+    scan-window-seconds: 300
+    scan-batch-size: 500
+    grace-count: 3
+    grace-seconds: 30
+    repair-max-attempts: 3
+    repair-batch-size: 100
+
+  metrics:
+    # Gauge 周期采样间隔（毫秒）；抓取只读内存
+    sample-interval-ms: 5000
+
+  execution-conflict:
+    # uk_execution_id 跨订单占用的事前检查（关闭则强制走兜底路径，供测试）
+    precheck-enabled: true
 
   eod:
     lease-seconds: 60

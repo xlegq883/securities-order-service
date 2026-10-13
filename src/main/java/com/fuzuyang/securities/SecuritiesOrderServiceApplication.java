@@ -2,6 +2,7 @@ package com.fuzuyang.securities;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
@@ -11,6 +12,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * 分层，依赖单向，防腐层只在最外层。
  */
 @EnableScheduling
+@ConfigurationPropertiesScan
 @SpringBootApplication
 public class SecuritiesOrderServiceApplication {
 
